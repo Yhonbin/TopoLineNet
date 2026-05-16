@@ -1,0 +1,38 @@
+# Model files
+*.pth
+*.pt
+*.onnx
+*.ckpt
+*.h5
+*.pb
+
+# Experiment outputs
+202605131048/
+exp_20260513_161321/
+Mean-Teacher/
+others_output/
+answer_output/
+pretrained_model/
+
+# Data directories
+data/
+test_data/
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.tiff
+
+# PDFs
+*.pdf
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Claude
+.claude/
