@@ -67,18 +67,22 @@ def cycle(iterable):
                 "请检查 './data_labeled' 或 './data_unlabeled' 文件夹内的文件数量。"
             )
             
-def simulate_hard_occlusion(imgs, p=0.8):
-    """数据增强：强迫模型学习在遮挡下推理连通性"""
+def simulate_hard_occlusion(imgs, intensity=1.0):
+    """遮挡强度由 intensity ∈ [0, 1] 控制，配合 consistency ramp 同步爬坡"""
     erased_imgs = imgs.clone()
+    p_eff = 0.3 + 0.5 * intensity                # 0.3 -> 0.8
+    num_max = max(2, int(2 + 2 * intensity))     # 2 -> 4 (上界,不含)
+    size_min = 20
+    size_max = int(40 + 40 * intensity)          # 40 -> 80
     for i in range(imgs.size(0)):
-        if torch.rand(1).item() < p:
+        if torch.rand(1).item() < p_eff:
             h, w = imgs.size(2), imgs.size(3)
-            # 模拟贴有白底黑字的标签
-            for _ in range(torch.randint(1, 4, (1,)).item()):
-                h_e, w_e = torch.randint(30, 80, (1,)).item(), torch.randint(30, 80, (1,)).item()
-                y1, x1 = torch.randint(0, h - h_e, (1,)).item(), torch.randint(0, w - w_e, (1,)).item()
-                erased_imgs[i, :, y1:y1+h_e, x1:x1+w_e] = 0.9 # 白色
-                # 模拟标签上的条形码/文字
+            for _ in range(torch.randint(1, num_max, (1,)).item()):
+                h_e = torch.randint(size_min, size_max, (1,)).item()
+                w_e = torch.randint(size_min, size_max, (1,)).item()
+                y1 = torch.randint(0, h - h_e, (1,)).item()
+                x1 = torch.randint(0, w - w_e, (1,)).item()
+                erased_imgs[i, :, y1:y1+h_e, x1:x1+w_e] = 0.9
                 if torch.rand(1).item() < 0.5:
                     erased_imgs[i, :, y1+10:y1+h_e-10, x1+10:x1+w_e-10] = torch.rand(1).item() * 0.5
     return erased_imgs
@@ -118,8 +122,8 @@ def train_experiment():
     dataset_val = HarnessDataset(VAL_DIR, augment=False) 
     if len(dataset_lab) == 0: exit("Error: No labeled data found.")
     drop_lab = len(dataset_lab) >= 2
-    loader_lab = DataLoader(dataset_lab, batch_size=8, shuffle=True, drop_last=drop_lab)
-    loader_val = DataLoader(dataset_val, batch_size=8, shuffle=False)
+    loader_lab = DataLoader(dataset_lab, batch_size=32, shuffle=True, drop_last=drop_lab,num_workers=4, persistent_workers=True, pin_memory=True)
+    loader_val = DataLoader(dataset_val, batch_size=32, shuffle=False,num_workers=4, persistent_workers=True, pin_memory=True)
     
     # 如果有无标签数据，则开启半监督模式
     use_semi_supervised = len(dataset_unlab) > 0
@@ -191,7 +195,7 @@ def train_experiment():
                     pseudo_labels = ema_model(imgs_unlab).detach() # 教师模型直接给出指导目标
                     
                 # 学生模型：输入被严重遮挡的图片，试图还原教师的预测结果
-                imgs_unlab_strong = simulate_hard_occlusion(imgs_unlab, p=0.8)
+                imgs_unlab_strong = simulate_hard_occlusion(imgs_unlab, intensity=current_consist_weight)
                 p_unlab_student = model(imgs_unlab_strong)
                 
                 # 计算一致性损失 (学生要在遮挡下猜出老师的答案)
