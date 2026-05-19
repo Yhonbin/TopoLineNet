@@ -1,295 +1,272 @@
-import torch
-import cv2
-import numpy as np
-import os
+"""
+evaluate_metric.py
+==================
+Drop-in evaluator for TopoLineNet (and any centerline-extraction baseline).
+
+Usage (single experiment):
+    python evaluate_metric.py \
+        --model_path ./exp_xxx/best_model.pth \
+        --test_dir   ./data/val \
+        --method_name "Ours-Full" \
+        --out_dir    ./eval_results
+
+Usage (programmatic — for batch comparison / ablation):
+    from evaluate_metric import Evaluator
+    ev = Evaluator(test_dir="./data/val", out_dir="./eval_results")
+    ev.run(model_path="./exp_A/best_model.pth", method_name="HRNet-baseline")
+    ev.run(model_path="./exp_B/best_model.pth", method_name="HRNet+clDice")
+    ev.run(model_path="./exp_C/best_model.pth", method_name="Ours-Full")
+    ev.export_summary()    # writes summary.csv + summary.tex
+
+Outputs (per method):
+    eval_results/
+        per_image/<method>.csv         — every metric for every image
+        summary.csv                    — one row per method, mean ± std
+        summary.tex                    — LaTeX-ready table fragment
+        meta/<method>.json             — config, runtime, image count
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
 from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import DataLoader
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 from skimage.morphology import skeletonize
 
-# 导入你的网络和数据集定义
-from utils import smooth_and_skeletonize
+from topo_metrics import compute_all, HEADLINE_METRICS
 
-# ==========================================
-# 1. 评价指标计算核心函数
-# ==========================================
 
-def calculate_cldice(pred_skel, gt_skel):
+# ---------------------------------------------------------------------------
+# Model-agnostic adapter: anything that maps tensor(B,3,H,W) -> tensor(B,1,H,W)
+# in [0,1] is acceptable. This lets you drop in U-Net / DeepLab / SegFormer
+# for baselines without touching the evaluator.
+# ---------------------------------------------------------------------------
+
+def default_predictor(model, imgs, device):
+    """Standard forward; override for models with multiple outputs."""
+    return model(imgs.to(device))
+
+
+# ---------------------------------------------------------------------------
+# Evaluator
+# ---------------------------------------------------------------------------
+
+class Evaluator:
     """
-    计算 Centerline Dice (clDice) - 衡量拓扑连通性的核心指标
-    要求输入为 0-1 二值化的 numpy 数组 (单通道骨架)
+    Reusable evaluator. Instantiate once with a test set, then call run()
+    for every method you want to compare. Results accumulate in self.summary.
     """
-    pred_skel = pred_skel > 0
-    gt_skel = gt_skel > 0
-    
-    tprec = (np.sum(pred_skel & gt_skel) + 1e-5) / (np.sum(pred_skel) + 1e-5)
-    tsens = (np.sum(pred_skel & gt_skel) + 1e-5) / (np.sum(gt_skel) + 1e-5)
-    
-    cl_dice = 2.0 * (tprec * tsens) / (tprec + tsens)
-    return cl_dice
 
-def calculate_relaxed_metrics(pred_skel, gt_skel, tolerance=3):
-    """
-    计算容差 Precision, Recall 和 F1-Score。
-    因为人工标注和网络预测的中心线极难做到像素级100%重合，
-    只要预测点在真实点的 `tolerance` 像素范围内，我们就认为它预测正确了。
-    """
-    # 计算预测骨架和真实骨架的距离变换矩阵
-    # 距离变换会计算背景中每个像素到最近的非零(骨架)像素的距离
-    gt_dist = cv2.distanceTransform((1 - gt_skel).astype(np.uint8), cv2.DIST_L2, 0)
-    pred_dist = cv2.distanceTransform((1 - pred_skel).astype(np.uint8), cv2.DIST_L2, 0)
-    
-    # Precision: 预测出的点，有多少落在 GT 的容差范围内
-    true_positives_p = np.sum((pred_skel > 0) & (gt_dist <= tolerance))
-    precision = (true_positives_p + 1e-5) / (np.sum(pred_skel > 0) + 1e-5)
-    
-    # Recall: GT 中的点，有多少被预测出的点覆盖了（在容差范围内）
-    true_positives_r = np.sum((gt_skel > 0) & (pred_dist <= tolerance))
-    recall = (true_positives_r + 1e-5) / (np.sum(gt_skel > 0) + 1e-5)
-    
-    # F1-Score
-    f1_score = 2.0 * precision * recall / (precision + recall + 1e-5)
-    
-    return precision, recall, f1_score
+    def __init__(self,
+                 test_dir: str,
+                 out_dir: str = "./eval_results",
+                 device: str | None = None,
+                 batch_size: int = 1,
+                 threshold: float = 0.5,
+                 num_workers: int = 2):
+        self.test_dir = test_dir
+        self.out_dir = Path(out_dir)
+        (self.out_dir / "per_image").mkdir(parents=True, exist_ok=True)
+        (self.out_dir / "meta").mkdir(parents=True, exist_ok=True)
 
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.batch_size = batch_size
+        self.threshold = threshold
+        self.num_workers = num_workers
 
-def calculate_breakage_rate(pred_skel, gt_skel, tolerance=3):
-    """
-    断裂率 (Breakage Rate, BR)：GT 骨架连续段中，预测骨架发生断裂的比例。
-    对 GT 骨架做 connected components，检查每条连续段是否被预测骨架连续覆盖。
-    """
-    num_components, gt_labels = cv2.connectedComponents(gt_skel.astype(np.uint8))
-    if num_components == 0:
-        return 0.0
+        # Build dataset once
+        from Datasets import HarnessDataset
+        self.dataset = HarnessDataset(test_dir, augment=False)
+        self.loader = DataLoader(self.dataset, batch_size=batch_size,
+                                 shuffle=False, num_workers=num_workers)
+        print(f"[Evaluator] test set = {test_dir}  ({len(self.dataset)} images)")
 
-    # 预测骨架的距离变换（用于容差匹配）
-    pred_dist = cv2.distanceTransform((1 - pred_skel).astype(np.uint8), cv2.DIST_L2, 0)
+        # Accumulator across methods
+        self.summary_rows = []     # list of dicts
 
-    broken_count = 0
-    for label_id in range(1, num_components + 1):
-        gt_segment = (gt_labels == label_id)
-        # 检查该段中是否有预测骨架覆盖（在容差范围内）
-        covered = np.sum(gt_segment & (pred_dist <= tolerance))
-        total = np.sum(gt_segment)
-        # 如果覆盖率低于 80%，认为该段发生断裂
-        if total > 0 and (covered / total) < 0.8:
-            broken_count += 1
+    # -----------------------------------------------------------------------
+    def run(self,
+            model,
+            method_name: str,
+            predictor_fn=default_predictor,
+            extra_meta: dict | None = None) -> pd.DataFrame:
+        """
+        Run a single method end-to-end.
 
-    return broken_count / num_components
+        Parameters
+        ----------
+        model        : nn.Module already on self.device, .eval()
+        method_name  : string, used as identifier in tables / filenames
+        predictor_fn : callable(model, imgs, device) -> tensor(B,1,H,W) in [0,1]
+        extra_meta   : optional dict logged into meta/<method>.json
 
+        Returns
+        -------
+        per_image_df : DataFrame, one row per image
+        """
+        model = model.to(self.device).eval()
 
-def calculate_connectivity_rate(pred_skel, gt_skel, tolerance=5):
-    """
-    连通率 (Connectivity Rate, CR)：预测骨架端点与 GT 端点的匹配比例。
-    端点定义：邻域（3x3）中非零像素数 = 1 的骨架像素。
-    """
-    def find_endpoints(skel):
-        """提取骨架端点"""
-        kernel = np.ones((3, 3), np.uint8)
-        kernel[1, 1] = 0
-        neighbor_count = cv2.filter2D(skel.astype(np.uint8), -1, kernel)
-        endpoints = np.argwhere((skel > 0) & (neighbor_count == 1))
-        return endpoints  # shape: (N, 2), 每行是 (row, col)
+        rows = []
+        t0 = time.time()
+        with torch.no_grad():
+            for idx, (imgs, targets) in enumerate(tqdm(self.loader,
+                                                       desc=f"[eval] {method_name}")):
+                preds = predictor_fn(model, imgs, self.device)
+                # Handle (logits vs sigmoid) — assume already in [0,1]
+                for b in range(preds.shape[0]):
+                    pred_np = preds[b, 0].cpu().numpy()
+                    gt_np = targets[b, 0].cpu().numpy()
 
-    pred_endpoints = find_endpoints(pred_skel)
-    gt_endpoints = find_endpoints(gt_skel)
+                    # Skeletonize both sides identically; this is the only
+                    # place post-processing happens, so all methods are
+                    # compared fairly.
+                    pred_skel = skeletonize(pred_np > self.threshold).astype(np.uint8)
+                    gt_skel = skeletonize(gt_np > 0.5).astype(np.uint8)
 
-    if len(gt_endpoints) == 0:
-        return 1.0 if len(pred_endpoints) == 0 else 0.0
-    if len(pred_endpoints) == 0:
-        return 0.0
+                    if gt_skel.sum() == 0:
+                        continue  # ignore degenerate GT
 
-    # 用距离变换做容差匹配
-    gt_dist = cv2.distanceTransform((1 - gt_skel).astype(np.uint8), cv2.DIST_L2, 0)
-    pred_dist = cv2.distanceTransform((1 - pred_skel).astype(np.uint8), cv2.DIST_L2, 0)
+                    m = compute_all(pred_skel, gt_skel)
+                    m["image_idx"] = idx * self.batch_size + b
+                    rows.append(m)
 
-    # 预测端点中，有多少在 GT 端点的容差范围内
-    matched_pred = 0
-    for ep in pred_endpoints:
-        r, c = ep
-        if gt_dist[r, c] <= tolerance:
-            matched_pred += 1
+        elapsed = time.time() - t0
+        per_image_df = pd.DataFrame(rows)
+        per_image_path = self.out_dir / "per_image" / f"{method_name}.csv"
+        per_image_df.to_csv(per_image_path, index=False)
+        print(f"[Evaluator] {method_name}: per-image -> {per_image_path}")
 
-    # GT 端点中，有多少在预测端点的容差范围内
-    matched_gt = 0
-    for ep in gt_endpoints:
-        r, c = ep
-        if pred_dist[r, c] <= tolerance:
-            matched_gt += 1
-
-    # 连通率 = 匹配数 / 较大端点数（取两个方向的平均）
-    cr_pred = matched_pred / len(pred_endpoints) if len(pred_endpoints) > 0 else 0
-    cr_gt = matched_gt / len(gt_endpoints) if len(gt_endpoints) > 0 else 0
-
-    return (cr_pred + cr_gt) / 2.0
-
-
-def calculate_intersection_accuracy(pred_skel, gt_skel, tolerance=5):
-    """
-    交叉点检测准确率 (Intersection Accuracy, IA)：
-    交叉点定义：邻域（3x3）中非零像素数 >= 3 的骨架像素。
-    返回 (IA-Precision, IA-Recall)。
-    """
-    def find_intersections(skel):
-        """提取骨架交叉点"""
-        kernel = np.ones((3, 3), np.uint8)
-        kernel[1, 1] = 0
-        neighbor_count = cv2.filter2D(skel.astype(np.uint8), -1, kernel)
-        intersections = np.argwhere((skel > 0) & (neighbor_count >= 3))
-        return intersections  # shape: (N, 2)
-
-    # 需要做聚类，因为交叉点往往是多个像素的簇
-    def cluster_points(points, merge_dist=8):
-        """将距离过近的交叉点像素合并为一个代表点"""
-        if len(points) == 0:
-            return np.array([]).reshape(0, 2)
-        clustered = []
-        used = set()
-        for i, p in enumerate(points):
-            if i in used:
+        # ----- aggregate -----
+        agg = {"method": method_name}
+        for col in per_image_df.columns:
+            if col in ("image_idx",):
                 continue
-            cluster = [p]
-            for j, q in enumerate(points):
-                if j != i and j not in used:
-                    if np.sqrt(np.sum((p - q) ** 2)) < merge_dist:
-                        cluster.append(q)
-                        used.add(j)
-            used.add(i)
-            clustered.append(np.mean(cluster, axis=0))
-        return np.array(clustered)
+            vals = per_image_df[col].values.astype(float)
+            agg[f"{col}_mean"] = float(np.mean(vals))
+            agg[f"{col}_std"] = float(np.std(vals))
+        agg["n_images"] = int(len(per_image_df))
+        agg["elapsed_sec"] = float(elapsed)
+        agg["ms_per_image"] = float(elapsed / max(1, len(per_image_df)) * 1000)
+        self.summary_rows.append(agg)
 
-    pred_ints = find_intersections(pred_skel)
-    gt_ints = find_intersections(gt_skel)
+        # ----- meta -----
+        meta = {
+            "method": method_name,
+            "test_dir": str(self.test_dir),
+            "device": str(self.device),
+            "threshold": self.threshold,
+            "n_images": agg["n_images"],
+            "elapsed_sec": agg["elapsed_sec"],
+            "ms_per_image": agg["ms_per_image"],
+            "params_M": _count_params(model),
+        }
+        if extra_meta:
+            meta.update(extra_meta)
+        with open(self.out_dir / "meta" / f"{method_name}.json", "w") as f:
+            json.dump(meta, f, indent=2)
 
-    pred_clustered = cluster_points(pred_ints)
-    gt_clustered = cluster_points(gt_ints)
+        # ----- pretty print -----
+        self._print_method_summary(method_name, agg)
+        return per_image_df
 
-    if len(pred_clustered) == 0 and len(gt_clustered) == 0:
-        return 1.0, 1.0
-    if len(pred_clustered) == 0:
-        return 0.0, 0.0
-    if len(gt_clustered) == 0:
-        return 0.0, 0.0
+    # -----------------------------------------------------------------------
+    def export_summary(self,
+                       csv_name: str = "summary.csv",
+                       tex_name: str = "summary.tex",
+                       headline_only: bool = True):
+        """
+        Write a cross-method summary table.
+        - csv  : machine-readable, every (mean, std) column.
+        - tex  : LaTeX fragment with headline metrics only, formatted "mean±std".
+        """
+        if not self.summary_rows:
+            print("[Evaluator] nothing to export.")
+            return None
 
-    # 匈牙利匹配（简化版：贪心匹配）
-    # 计算距离矩阵
-    dist_matrix = np.zeros((len(pred_clustered), len(gt_clustered)))
-    for i, p in enumerate(pred_clustered):
-        for j, g in enumerate(gt_clustered):
-            dist_matrix[i, j] = np.sqrt(np.sum((p - g) ** 2))
+        df = pd.DataFrame(self.summary_rows)
+        df.to_csv(self.out_dir / csv_name, index=False)
+        print(f"[Evaluator] summary -> {self.out_dir / csv_name}")
 
-    # 贪心匹配
-    matched = 0
-    used_pred = set()
-    used_gt = set()
-    # 按距离排序
-    indices = np.unravel_index(np.argsort(dist_matrix, axis=None), dist_matrix.shape)
-    for idx in range(len(indices[0])):
-        pi, gi = indices[0][idx], indices[1][idx]
-        if pi in used_pred or gi in used_gt:
-            continue
-        if dist_matrix[pi, gi] <= tolerance:
-            matched += 1
-            used_pred.add(pi)
-            used_gt.add(gi)
+        # LaTeX fragment with the headline metrics
+        cols = HEADLINE_METRICS if headline_only else \
+            [c[:-5] for c in df.columns if c.endswith("_mean")]
+        lines = []
+        lines.append(r"\begin{tabular}{l" + "c" * len(cols) + "}")
+        lines.append(r"\toprule")
+        lines.append("Method & " + " & ".join(cols) + r" \\")
+        lines.append(r"\midrule")
+        for _, row in df.iterrows():
+            cells = [row["method"]]
+            for c in cols:
+                m = row.get(f"{c}_mean", float("nan"))
+                s = row.get(f"{c}_std", float("nan"))
+                cells.append(f"{m:.3f}$\\pm${s:.3f}")
+            lines.append(" & ".join(cells) + r" \\")
+        lines.append(r"\bottomrule")
+        lines.append(r"\end{tabular}")
+        with open(self.out_dir / tex_name, "w") as f:
+            f.write("\n".join(lines))
+        print(f"[Evaluator] LaTeX  -> {self.out_dir / tex_name}")
+        return df
 
-    ia_precision = matched / len(pred_clustered) if len(pred_clustered) > 0 else 0
-    ia_recall = matched / len(gt_clustered) if len(gt_clustered) > 0 else 0
+    # -----------------------------------------------------------------------
+    def _print_method_summary(self, name, agg):
+        print(f"\n=== {name} ===")
+        for k in HEADLINE_METRICS:
+            mk, sk = f"{k}_mean", f"{k}_std"
+            if mk in agg:
+                print(f"  {k:14s} : {agg[mk]:.4f} ± {agg[sk]:.4f}")
+        print(f"  inference     : {agg['ms_per_image']:.1f} ms/img")
+        print("")
 
-    return ia_precision, ia_recall
+
+# ---------------------------------------------------------------------------
+def _count_params(model) -> float:
+    n = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return float(n / 1e6)
 
 
-# ==========================================
-# 2. 在整个测试集上运行评估 (Run Evaluation)
-# ==========================================
+# ---------------------------------------------------------------------------
+# CLI for single-method evaluation (backwards-compatible with old usage)
+# ---------------------------------------------------------------------------
 
-def evaluate_testset(model_path, test_dir, device='cuda'):
-    """
-    在论文的 Test Set 上计算平均指标，并输出可以直接填入论文表格的数据
-    """
-    # 初始化模型与数据
-    from HRNet import HarnessHRNetV2 # 请确保能正确import
-    from Datasets import HarnessDataset
-    
+def _build_default_model(model_path, device):
+    """Default loader for HarnessHRNetV2; override for other architectures."""
+    from HRNet import HarnessHRNetV2
     model = HarnessHRNetV2(pretrained=False).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval()
-    
-    # 测试集绝不能加数据增强
-    test_dataset = HarnessDataset(test_dir, augment=False)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
-    
-    metrics = {
-        'clDice': [],
-        'Precision (Tol=3)': [],
-        'Recall (Tol=3)': [],
-        'F1-Score (Tol=3)': [],
-        'Breakage Rate': [],
-        'Connectivity Rate': [],
-        'IA-Precision': [],
-        'IA-Recall': []
-    }
-    
-    print(f"[*] 🚀 开始评估测试集，共 {len(test_dataset)} 张图像...")
-    
-    with torch.no_grad():
-        for _, (imgs, targets) in enumerate(tqdm(test_loader)):
-            imgs, targets = imgs.to(device), targets.to(device)
-            
-            # 1. 网络推理
-            preds = model(imgs)
-            
-            # 2. 转换为 Numpy，并提取网络预测的单像素骨架
-            pred_np = preds[0].cpu().numpy().squeeze()
-            pred_skel = smooth_and_skeletonize(pred_np, threshold=0.5)
-            
-            # 3. 提取 GT 的单像素骨架
-            # 因为 targets 是有一定宽度(3-5px)的 ribbon，需要对其进行骨架化作为真值骨架
-            gt_np = targets[0].cpu().numpy().squeeze()
-            gt_skel = skeletonize(gt_np > 0.5).astype(np.uint8)
-            
-            # 如果某张图连 GT 都没有（预防万一），跳过
-            if np.sum(gt_skel) == 0:
-                continue
-                
-            # 4. 计算指标
-            cldice = calculate_cldice(pred_skel, gt_skel)
-            precision, recall, f1 = calculate_relaxed_metrics(pred_skel, gt_skel, tolerance=3)
-            br = calculate_breakage_rate(pred_skel, gt_skel, tolerance=3)
-            cr = calculate_connectivity_rate(pred_skel, gt_skel, tolerance=5)
-            ia_prec, ia_rec = calculate_intersection_accuracy(pred_skel, gt_skel, tolerance=5)
+    state = torch.load(model_path, map_location=device)
+    # tolerate both DataParallel and bare state_dicts
+    state = {k.replace("module.", ""): v for k, v in state.items()}
+    model.load_state_dict(state, strict=False)
+    return model
 
-            metrics['clDice'].append(cldice)
-            metrics['Precision (Tol=3)'].append(precision)
-            metrics['Recall (Tol=3)'].append(recall)
-            metrics['F1-Score (Tol=3)'].append(f1)
-            metrics['Breakage Rate'].append(br)
-            metrics['Connectivity Rate'].append(cr)
-            metrics['IA-Precision'].append(ia_prec)
-            metrics['IA-Recall'].append(ia_rec)
-            
-    # ==========================================
-    # 3. 输出论文表格所需的数据
-    # ==========================================
-    n = len(metrics['clDice'])
-    print("\n" + "="*50)
-    print("论文测试集最终评估结果 (Test Set Results)")
-    print("="*50)
-    print(f"Total Test Images evaluated  : {n}")
-    print(f"Mean clDice                  : {np.mean(metrics['clDice']):.4f} ± {np.std(metrics['clDice']):.4f}")
-    print(f"Mean Relaxed Precision       : {np.mean(metrics['Precision (Tol=3)']):.4f} ± {np.std(metrics['Precision (Tol=3)']):.4f}")
-    print(f"Mean Relaxed Recall          : {np.mean(metrics['Recall (Tol=3)']):.4f} ± {np.std(metrics['Recall (Tol=3)']):.4f}")
-    print(f"Mean Relaxed F1-Score        : {np.mean(metrics['F1-Score (Tol=3)']):.4f} ± {np.std(metrics['F1-Score (Tol=3)']):.4f}")
-    print("-" * 50)
-    print(f"Mean Breakage Rate (BR)      : {np.mean(metrics['Breakage Rate']):.4f} ± {np.std(metrics['Breakage Rate']):.4f}")
-    print(f"Mean Connectivity Rate (CR)  : {np.mean(metrics['Connectivity Rate']):.4f} ± {np.std(metrics['Connectivity Rate']):.4f}")
-    print(f"Mean IA-Precision            : {np.mean(metrics['IA-Precision']):.4f} ± {np.std(metrics['IA-Precision']):.4f}")
-    print(f"Mean IA-Recall               : {np.mean(metrics['IA-Recall']):.4f} ± {np.std(metrics['IA-Recall']):.4f}")
-    print("="*50)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_path", default="./exp_20260513_161321/best_model.pth")
+    parser.add_argument("--test_dir", default="./data/val")
+    parser.add_argument("--method_name", default="model")
+    parser.add_argument("--out_dir", default="./eval_results")
+    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--device", default=None)
+    args = parser.parse_args()
+
+    ev = Evaluator(test_dir=args.test_dir,
+                   out_dir=args.out_dir,
+                   device=args.device,
+                   threshold=args.threshold)
+    model = _build_default_model(args.model_path, ev.device)
+    ev.run(model, method_name=args.method_name,
+           extra_meta={"checkpoint": args.model_path})
+    ev.export_summary()
+
 
 if __name__ == "__main__":
-    # 请修改为您保存的最优模型路径和测试集路径
-    MODEL_WEIGHTS = "./202605131048/best_model.pth"
-    TEST_DATA_DIR = "./data/val"  # 可以分别测试 easy, medium, hard
-    
-    evaluate_testset(MODEL_WEIGHTS, TEST_DATA_DIR)
+    main()
