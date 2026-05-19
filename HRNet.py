@@ -7,60 +7,59 @@ import numpy as np
 # ==========================================
 # Module 1: Models (HRNet + CBAM + Strip Pooling)
 # ==========================================
-class CBAMLayer(nn.Module):
-    """CBAM 注意力机制：提升模型在复杂背景（如白色标签）下的辨别力"""
-    def __init__(self, channels, reduction=16):
-        super(CBAMLayer, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Conv2d(channels, channels // reduction, 1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // reduction, channels, 1, bias=False)
-        )
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = self.fc(self.avg_pool(x))
-        max_out = self.fc(self.max_pool(x))
-        out = self.sigmoid(avg_out + max_out)
-        return x * out
-    
-    
-
 # class CBAMLayer(nn.Module):
+#     """CBAM 注意力机制：提升模型在复杂背景（如白色标签）下的辨别力"""
 #     def __init__(self, channels, reduction=16):
-#         super().__init__()
-        
-#         # Channel Attention
+#         super(CBAMLayer, self).__init__()
 #         self.avg_pool = nn.AdaptiveAvgPool2d(1)
 #         self.max_pool = nn.AdaptiveMaxPool2d(1)
-#         self.mlp = nn.Sequential(
+#         self.fc = nn.Sequential(
 #             nn.Conv2d(channels, channels // reduction, 1, bias=False),
-#             nn.ReLU(),
+#             nn.ReLU(inplace=True),
 #             nn.Conv2d(channels // reduction, channels, 1, bias=False)
 #         )
 #         self.sigmoid = nn.Sigmoid()
 
-#         # Spatial Attention
-#         self.spatial = nn.Sequential(
-#             nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False),
-#             nn.Sigmoid()
-#         )
 #     def forward(self, x):
-#         # Channel Attention
-#         avg_out = self.mlp(self.avg_pool(x))
-#         max_out = self.mlp(self.max_pool(x))
-#         x = x * self.sigmoid(avg_out + max_out)
-#         # Spatial Attention
-#         avg_out = torch.mean(x, dim=1, keepdim=True)
-#         max_out, _ = torch.max(x, dim=1, keepdim=True)
-#         spatial = torch.cat([avg_out, max_out], dim=1)
-#         spatial = self.spatial(spatial)
-#         x = x * spatial
-#         return x
+#         avg_out = self.fc(self.avg_pool(x))
+#         max_out = self.fc(self.max_pool(x))
+#         out = self.sigmoid(avg_out + max_out)
+#         return x * out
+    
+    
+class CBAMLayer(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        
+        # Channel Attention
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
+            nn.ReLU(),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
 
-class StripPooling(nn.Module):
+        # Spatial Attention
+        self.spatial = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        # Channel Attention
+        avg_out = self.mlp(self.avg_pool(x))
+        max_out = self.mlp(self.max_pool(x))
+        x = x * self.sigmoid(avg_out + max_out)
+        # Spatial Attention
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        spatial = torch.cat([avg_out, max_out], dim=1)
+        spatial = self.spatial(spatial)
+        x = x * spatial
+        return x
+
+class StripPooling(nn.Module): 
     """条形池化：跨越白色标签遮挡的核心"""
     def __init__(self, in_channels, pool_size=(256, 256)):
         super().__init__()
@@ -145,12 +144,16 @@ class HarnessHRNetV2(nn.Module):
         # Head A: 预测线束中心线
         self.head_line = nn.Sequential(
             nn.Conv2d(aspp_out_channels, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 1, kernel_size=1) # 输出单通道热力图
+            nn.BatchNorm2d(128),nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),  # H/4 -> H/2
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),   # H/2 -> H
+            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=1) # 输出单通道热力图
         )
 
     def forward(self, x):
