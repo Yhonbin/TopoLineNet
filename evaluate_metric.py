@@ -250,7 +250,7 @@ def _build_default_model(model_path, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", default="./exp_20260513_161321/best_model.pth")
+    parser.add_argument("--model_path", default="./exp_20260519_112009/best_model.pth")
     parser.add_argument("--test_dir", default="./data/val")
     parser.add_argument("--method_name", default="model")
     parser.add_argument("--out_dir", default="./eval_results")
