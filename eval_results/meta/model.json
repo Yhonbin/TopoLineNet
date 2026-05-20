@@ -1,0 +1,11 @@
+{
+  "method": "model",
+  "test_dir": "./data/val",
+  "device": "cuda",
+  "threshold": 0.5,
+  "n_images": 11,
+  "elapsed_sec": 2.7886135578155518,
+  "ms_per_image": 253.5103234377774,
+  "params_M": 26.384575,
+  "checkpoint": "./exp_20260519_112009/best_model.pth"
+}

@@ -1,0 +1,11 @@
+{
+  "method": "unet",
+  "test_dir": "./data/val",
+  "device": "cuda",
+  "threshold": 0.5,
+  "n_images": 11,
+  "elapsed_sec": 2.0137999057769775,
+  "ms_per_image": 183.07271870699796,
+  "params_M": 24.436369,
+  "checkpoint": "exp_compare/unet/best_model.pth"
+}
