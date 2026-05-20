@@ -15,39 +15,133 @@ from loss import hybrid_loss_fn, harness_topology_loss
 from skimage.morphology import skeletonize
 from utils import smooth_and_skeletonize
 from datetime import datetime
+import json
+import argparse
 
-
-# os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"  # 根据你的 GPU 数量调整
+# os.environ["CUDA_VISIBLE_DEVICES"] = "2,3" 
 
 class ExperimentLogger:
     def __init__(self, log_dir):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.history = {'epoch': [], 'loss': [], 'loss_sup': [], 'loss_unsup': [], 'val_loss': []}
+        self.history_path = self.log_dir / "history.json"
+        # 若存在历史 history,加载以支持断点续训
+        if self.history_path.exists():
+            with open(self.history_path, 'r') as f:
+                self.history = json.load(f)
+        else:
+            self.history = {'epoch': [], 'loss': [], 'loss_sup': [],
+                            'loss_unsup': [], 'val_loss': []}
         
-    def update(self, epoch, loss, loss_sup, loss_unsup,val_loss):
+    def update(self, epoch, loss, loss_sup, loss_unsup, val_loss):
         self.history['epoch'].append(epoch)
         self.history['loss'].append(loss)
         self.history['loss_sup'].append(loss_sup)
         self.history['loss_unsup'].append(loss_unsup)
         self.history['val_loss'].append(val_loss)
+        # 实时持久化,防止训练中断丢失
+        with open(self.history_path, 'w') as f:
+            json.dump(self.history, f, indent=2)
         
     def plot_loss(self):
         plt.style.use('seaborn-v0_8-paper')
         fig, ax = plt.subplots(figsize=(8, 5))
-        
-        # 绘制训练总损失（黑色实线）
-        ax.plot(self.history['epoch'], self.history['loss'], label='Train Total Loss', color='black', linewidth=2)
-        # 绘制验证总损失（红色实线，醒目对比）
-        ax.plot(self.history['epoch'], self.history['val_loss'], label='Validation Loss', color='red', linewidth=2)
-        
+        ax.plot(self.history['epoch'], self.history['loss'], label='Train Total', color='black', linewidth=2)
+        ax.plot(self.history['epoch'], self.history['val_loss'], label='Validation', color='red', linewidth=2)
         ax.plot(self.history['epoch'], self.history['loss_sup'], label='Supervised', linestyle='--')
         ax.plot(self.history['epoch'], self.history['loss_unsup'], label='Unsupervised', linestyle=':')
         ax.set_title('Training and Validation Convergence', fontsize=12)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss')
         ax.grid(True, linestyle=':', alpha=0.6)
-        ax.legend(); plt.tight_layout()
-        plt.savefig(self.log_dir / "convergence_curve.pdf"); plt.close()
+        ax.legend()
+        plt.tight_layout()
+        plt.savefig(self.log_dir / "convergence_curve.pdf")
+        plt.close()
         
+        
+class EarlyStopping:
+    """
+    简单早停:验证 loss 连续 patience 个 epoch 没有改善超过 min_delta,则停止
+    """
+    def __init__(self, patience=20, min_delta=1e-4):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_loss = float('inf')
+        self.counter = 0
+        self.should_stop = False
+ 
+    def step(self, val_loss):
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            return True   # improved
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.should_stop = True
+            return False
+ 
+    def state_dict(self):
+        return {'best_loss': self.best_loss, 'counter': self.counter,
+                'should_stop': self.should_stop}
+ 
+    def load_state_dict(self, sd):
+        self.best_loss = sd['best_loss']
+        self.counter = sd['counter']
+        self.should_stop = sd['should_stop']
+
+
+def save_checkpoint(path, model, ema_model, optimizer, scheduler, scaler,
+                    early_stopper, epoch, best_val_loss):
+    """
+    保存完整训练状态,支持断点续训
+    """
+    def _state(m):
+        return m.module.state_dict() if hasattr(m, 'module') else m.state_dict()
+ 
+    ckpt = {
+        'epoch': epoch,
+        'best_val_loss': best_val_loss,
+        'model': _state(model),
+        'ema_model': _state(ema_model) if ema_model is not None else None,
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict(),
+        'scaler': scaler.state_dict() if scaler is not None else None,
+        'early_stopper': early_stopper.state_dict(),
+    }
+    # 原子写:先写 tmp 再 rename,避免训练中断时 ckpt 写一半
+    tmp_path = str(path) + ".tmp"
+    torch.save(ckpt, tmp_path)
+    os.replace(tmp_path, path)
+    
+def load_checkpoint(path, model, ema_model, optimizer, scheduler, scaler,
+                    early_stopper, device):
+    """
+    加载完整训练状态
+    """
+    ckpt = torch.load(path, map_location=device)
+ 
+    def _load(m, sd):
+        if sd is None:
+            return
+        if hasattr(m, 'module'):
+            m.module.load_state_dict(sd, strict=False)
+        else:
+            m.load_state_dict(sd, strict=False)
+ 
+    _load(model, ckpt['model'])
+    if ema_model is not None:
+        _load(ema_model, ckpt.get('ema_model'))
+    optimizer.load_state_dict(ckpt['optimizer'])
+    scheduler.load_state_dict(ckpt['scheduler'])
+    if scaler is not None and ckpt.get('scaler') is not None:
+        scaler.load_state_dict(ckpt['scaler'])
+    early_stopper.load_state_dict(ckpt['early_stopper'])
+ 
+    return ckpt['epoch'], ckpt['best_val_loss']
+
+
 # ==========================================
 # Module 4: Execution Entry
 # ==========================================
@@ -60,12 +154,7 @@ def cycle(iterable):
             is_empty = False
             yield x
         if is_empty:
-            raise RuntimeError(
-                "\n[致命错误] DataLoader 为空！程序已拦截死循环。\n"
-                "原因分析：可能你的数据文件夹中图片少于 batch_size (当前为2)，"
-                "且 DataLoader 设置了 drop_last=True 导致所有数据被丢弃。\n"
-                "请检查 './data_labeled' 或 './data_unlabeled' 文件夹内的文件数量。"
-            )
+            raise RuntimeError("DataLoader empty")
             
 def simulate_hard_occlusion(imgs, intensity=1.0):
     """遮挡强度由 intensity ∈ [0, 1] 控制，配合 consistency ramp 同步爬坡"""
@@ -87,187 +176,286 @@ def simulate_hard_occlusion(imgs, intensity=1.0):
                     erased_imgs[i, :, y1+10:y1+h_e-10, x1+10:x1+w_e-10] = torch.rand(1).item() * 0.5
     return erased_imgs
             
-def get_current_consistency_weight(epoch, max_epochs=150, max_weight=0.8, rampup_length=0.3):
+def get_current_consistency_weight(epoch, max_epochs, max_weight=0.6, rampup_length=0.4):
     """自监督权重温和预热函数：前 30% epochs 慢慢增加到 max_weight"""
     rampup_epochs = max_epochs * rampup_length
     if epoch < rampup_epochs:
         p = max(0.0, float(epoch) / float(rampup_epochs))
         rampup_value = math.exp(-5.0 * (1.0 - p) ** 2) # 高斯预热曲线
         return max_weight * rampup_value
-    else:
-        return max_weight
+    return max_weight
     
 # EMA 更新函数：缓慢更新教师模型
-def update_ema_variables(model, ema_model, alpha=0.99):
-    for ema_param, param in zip(ema_model.parameters(), model.parameters()):
-        ema_param.data.mul_(alpha).add_(param.data, alpha=1 - alpha)
+@torch.no_grad()
+def update_ema_variables(model, ema_model, alpha=0.995):
+    msd = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+    esd = ema_model.module.state_dict() if hasattr(ema_model, 'module') else ema_model.state_dict()
+    for k in esd.keys():
+        if esd[k].dtype.is_floating_point:
+            esd[k].mul_(alpha).add_(msd[k].detach(), alpha=1 - alpha)
 
 def train_experiment():
-    # 1. Init
-    LABELED_DIR = "./data/train"     # 存放 10 张图 + json 的文件夹.训练集文件夹
-    UNLABELED_DIR = "./data/data_unlabeled" # 存放几十/上百张没标注的图片的文件夹
-    VAL_DIR = "./data/val"           # 存放验证集的文件夹，结构同 train
-    # DEVICE = torch.device('cuda:2' if torch.cuda.is_available() else 'cpu')
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    RES_DIR = os.path.join('.', f"exp_{timestamp}") 
     
-    # 检测 GPU 数量
+    args = parse_args()
+    # ------- 实验目录 -------
+    if args.resume:
+        resume_path = Path(args.resume)
+        if resume_path.is_dir():
+            exp_dir = resume_path
+            ckpt_path = exp_dir / "last_model.pth"
+        else:
+            ckpt_path = resume_path
+            exp_dir = resume_path.parent
+        assert ckpt_path.exists(), f"checkpoint 不存在: {ckpt_path}"
+        print(f"[Resume] 续训目录: {exp_dir}, ckpt: {ckpt_path}")
+    else:
+        if args.exp_dir:
+            exp_dir = Path(args.exp_dir)
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            exp_dir = Path(f"./exp_{timestamp}")
+        exp_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = exp_dir / "last_model.pth"
+        print(f"[New] 新建实验目录: {exp_dir}")
+    # 保存运行配置
+    with open(exp_dir / "config.json", 'w') as f:
+        json.dump(vars(args), f, indent=2)
+    
+    # ------- 设备 -------
     num_gpus = torch.cuda.device_count()
-    DEVICE = torch.device('cuda' if num_gpus > 0 else 'cpu')
-    print(f"[*] Detected {num_gpus} GPUs. Using device: {DEVICE}")
-    # 如果检测到多张卡，使用 DataParallel 包装模型
+    device = torch.device('cuda' if num_gpus > 0 else 'cpu')
+    use_dp = (num_gpus > 1) and (not args.no_dataparallel)
+    print(f"[*] GPUs: {num_gpus}, device: {device}, DataParallel: {use_dp}")
+    # cudnn 性能优化:固定 input 尺寸时开启 benchmark
+    torch.backends.cudnn.benchmark = True
     
-    dataset_lab = HarnessDataset(LABELED_DIR, augment=True)
-    dataset_unlab = UnlabeledHarnessDataset(UNLABELED_DIR)
-    dataset_val = HarnessDataset(VAL_DIR, augment=False) 
-    if len(dataset_lab) == 0: exit("Error: No labeled data found.")
-    drop_lab = len(dataset_lab) >= 2
-    loader_lab = DataLoader(dataset_lab, batch_size=32, shuffle=True, drop_last=drop_lab,num_workers=4, persistent_workers=True, pin_memory=True)
-    loader_val = DataLoader(dataset_val, batch_size=32, shuffle=False,num_workers=4, persistent_workers=True, pin_memory=True)
-    
-    # 如果有无标签数据，则开启半监督模式
-    use_semi_supervised = len(dataset_unlab) > 0
+     # ------- 数据 -------
+    ds_lab = HarnessDataset(args.labeled_dir, augment=True)
+    ds_unlab = UnlabeledHarnessDataset(args.unlabeled_dir)
+    ds_val = HarnessDataset(args.val_dir, augment=False)
+    assert len(ds_lab) > 0, "标注数据为空"
+ 
+    drop_lab = len(ds_lab) >= args.bs_lab
+    loader_lab = DataLoader(ds_lab, batch_size=args.bs_lab, shuffle=True,
+                            drop_last=drop_lab,
+                            num_workers=args.workers,
+                            persistent_workers=(args.workers > 0),
+                            pin_memory=True)
+    loader_val = DataLoader(ds_val, batch_size=args.bs_val, shuffle=False,
+                            num_workers=max(1, args.workers // 2),
+                            persistent_workers=(args.workers > 0),
+                            pin_memory=True)
+ 
+    use_semi = len(ds_unlab) > 0
     
     #------------ 关闭无标注数据------------#
-    # use_semi_supervised = False
+    # use_semi = False
     
-    if use_semi_supervised:
-        loader_unlab = DataLoader(dataset_unlab, batch_size=8, shuffle=True, drop_last=drop_lab)
-        iter_unlab = iter(cycle(loader_unlab)) # 
-        
-    # 1. 学生模型 (被优化器更新)
-    model = HarnessHRNetV2(pretrained=True).to(DEVICE)
-    # 2. 教师模型 (不参与反向传播，仅通过 EMA 更新)
-    ema_model = HarnessHRNetV2(pretrained=False).to(DEVICE)
-    ema_model.load_state_dict(model.state_dict()) # 初始化权重相同
-    for param in ema_model.parameters():
-        param.detach_()
-    if num_gpus > 1:
-        print(f"[*] Multi-GPU mode enabled. Using {num_gpus} GPUs with DataParallel.")
-        model = nn.DataParallel(model)
-        ema_model =nn.DataParallel(ema_model)
-    base_lr = 5e-4
-    optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr * max(1, num_gpus // 2), weight_decay=1e-3)
-    MAX_EPOCHS = 200
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS, eta_min=1e-5)
-    
-    logger = ExperimentLogger(RES_DIR)
+    if use_semi:
+        loader_unlab = DataLoader(ds_unlab, batch_size=args.bs_unlab, shuffle=True,
+                                  drop_last=True,
+                                  num_workers=max(1, args.workers // 2),
+                                  persistent_workers=(args.workers > 0),
+                                  pin_memory=True)
+        iter_unlab = iter(cycle(loader_unlab))
+    print(f"[*] labeled={len(ds_lab)}, unlabeled={len(ds_unlab)}, val={len(ds_val)}")
+    print(f"[*] len(loader_lab)={len(loader_lab)}, "
+          f"len(loader_unlab)={len(loader_unlab) if use_semi else 0}")
 
-    # 定义一个 Epoch 的长度：取标注数据和未标注数据中 Batch 较多的那个
-    iterations_per_epoch = len(loader_lab) * 2 if use_semi_supervised else len(loader_lab)
-    # 提取有标签的数据
-    iter_lab = iter(cycle(loader_lab))
+        
+    # ------- 模型 -------
+    model = HarnessHRNetV2(pretrained=(args.resume is None)).to(device)
+    if use_semi:
+        ema_model = HarnessHRNetV2(pretrained=False).to(device)
+        ema_model.load_state_dict(model.state_dict())
+        for p in ema_model.parameters():
+            p.requires_grad_(False)
+    else:
+        ema_model = None
+ 
+    if use_dp:
+        model = nn.DataParallel(model)
+        # 教师模型 batch 小,放单卡反而更快;此处不包 DataParallel
+        
+    # ------- 优化器 / 调度器 / AMP -------
+    # 学习率不再乘以 GPU 数量,因为 batch_size 没有等比增大
+    optimizer = torch.optim.AdamW(model.parameters(),
+                                  lr=args.base_lr, weight_decay=args.wd)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=1e-6)
+    scaler = torch.amp.GradScaler("cuda", enabled=args.amp)     
+   
+    # ------- 一个 epoch 真正合理的 step 数 -------
+    if use_semi:
+        # 让数据量大的一侧每个 epoch 至少完整过一遍
+        iterations_per_epoch = max(len(loader_lab), len(loader_unlab))
+    else:
+        iterations_per_epoch = len(loader_lab)
+    print(f"[*] iterations_per_epoch = {iterations_per_epoch}")
     
-    best_val_loss = float('inf') # 用于跟踪最佳验证损失，保存最优模型
+    # ------- Logger / 早停 -------
+    logger = ExperimentLogger(exp_dir)
+    early_stopper = EarlyStopping(patience=args.patience, min_delta=args.min_delta)
+    
+    # ------- Resume -------
+    start_epoch = 1
+    best_val_loss = float('inf')
+    if args.resume:
+        start_epoch, best_val_loss = load_checkpoint(
+            ckpt_path, model, ema_model, optimizer, scheduler, scaler,
+            early_stopper, device)
+        start_epoch += 1
+        print(f"[Resume] 从 epoch {start_epoch} 继续, best_val_loss={best_val_loss:.4f}")
+ 
+    iter_lab = iter(cycle(loader_lab))
 
     # 2. Loop
-    print(f"Starting Semi-Supervised Training | Labeled: {len(dataset_lab)} | Unlabeled: {len(dataset_unlab)}")
+    print(f"Starting Semi-Supervised Training | Labeled: {len(ds_lab)} | Unlabeled: {len(ds_unlab)}")
 
-    for epoch in range(1, MAX_EPOCHS+1):
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
-        total_loss, total_sup, total_unsup = 0, 0, 0
-        current_consist_weight = get_current_consistency_weight(epoch, max_epochs=MAX_EPOCHS, max_weight=1.0)
+        if ema_model is not None:
+            ema_model.eval()  # 教师不开 dropout/BN train
+        total_loss = total_sup = total_unsup = 0.0
+        consist_w = get_current_consistency_weight(
+            epoch, args.epochs, args.max_consist_w, args.rampup)
+ 
 
         # 使用 tqdm 进度条展示每一轮内部的进度
-        pbar = tqdm(range(iterations_per_epoch), desc=f"Epoch {epoch}/{MAX_EPOCHS}", unit="batch")
+        pbar = tqdm(range(iterations_per_epoch),desc=f"Epoch {epoch}/{args.epochs}", unit="batch")
         for _ in pbar:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             # ---------------------------------------------------------
             # Step 1: 有监督学习 (Supervised on Labeled Data)
             # ---------------------------------------------------------
             imgs_lab, t_line = next(iter_lab)
-            imgs_lab, t_line = imgs_lab.to(DEVICE), t_line.to(DEVICE)
+            imgs_lab, t_line = imgs_lab.to(device, non_blocking=True), t_line.to(device, non_blocking=True)
             
-            # ------------在有标签的数据上直接贴白块，让带有 GT 的数据教网络跨越障碍！------------
-            # imgs_lab_aug = simulate_hard_occlusion(imgs_lab, p=0.7)
-            # -----------------------
-            p_line = model(imgs_lab)
-            supervised_loss = harness_topology_loss(p_line, t_line)  
+            with torch.amp.autocast(device_type="cuda", enabled=args.amp):
+                p_line = model(imgs_lab)
+                if p_line.shape[-2:] != t_line.shape[-2:]:
+                    t_line = F.interpolate(t_line, size=p_line.shape[-2:],
+                                           mode='bilinear', align_corners=False)
+                supervised_loss = harness_topology_loss(p_line.float(), t_line)  
             
-            # ---------------------------------------------------------
-            # Step 2: 自监督一致性学习 (Self-Supervised on Unlabeled Data)
-            # ---------------------------------------------------------
-            consistency_loss = torch.tensor(0.0).to(DEVICE)
-            
-            if use_semi_supervised:
-                imgs_unlab = next(iter_unlab).to(DEVICE)
-                with torch.no_grad():
-                    pseudo_labels = ema_model(imgs_unlab).detach() # 教师模型直接给出指导目标
-                    
-                # 学生模型：输入被严重遮挡的图片，试图还原教师的预测结果
-                imgs_unlab_strong = simulate_hard_occlusion(imgs_unlab, intensity=current_consist_weight)
-                p_unlab_student = model(imgs_unlab_strong)
+                # ---------------------------------------------------------
+                # Step 2: 自监督一致性学习 (Self-Supervised on Unlabeled Data)
+                # ---------------------------------------------------------
+                consistency_loss = torch.tensor(0.0,device=device)
+                if use_semi:
+                    imgs_unlab = next(iter_unlab).to(device, non_blocking=True)
+                    with torch.no_grad():
+                        pseudo = ema_model(imgs_unlab).detach() # 教师模型直接给出指导目标
+                        
+                    # 学生模型：输入被严重遮挡的图片，试图还原教师的预测结果
+                    imgs_unlab_strong = simulate_hard_occlusion(imgs_unlab, intensity=consist_w / max(args.max_consist_w, 1e-6))
+                    p_student = model(imgs_unlab_strong)
+                    if p_student.shape != pseudo.shape:
+                            pseudo = F.interpolate(pseudo, size=p_student.shape[-2:],
+                                                mode='bilinear', align_corners=False)
+                    # 计算一致性损失 (学生要在遮挡下猜出老师的答案)
+                    consistency_loss = F.mse_loss(p_student.float(), pseudo.float()) * 10.0
                 
-                # 计算一致性损失 (学生要在遮挡下猜出老师的答案)
-                consistency_loss = nn.MSELoss()(p_unlab_student, pseudo_labels) * 10.0
-                
-            # ---------------------------------------------------------
-            # Step 3: 联合优化
-            # ---------------------------------------------------------
-            loss = supervised_loss + current_consist_weight * consistency_loss
-            loss.backward()
-            optimizer.step()
+                loss = supervised_loss + consist_w * consistency_loss
+            # AMP 反传
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            scaler.step(optimizer)
+            scaler.update()
             
-            # 更新教师模型权重 (动量 0.99)
-            if use_semi_supervised:
-                update_ema_variables(model, ema_model, alpha=0.99)
+            # 更新教师模型权重
+            if use_semi:
+                update_ema_variables(model, ema_model, alpha=args.ema_alpha)
             
             total_loss += loss.item()
             total_sup += supervised_loss.item()
-            if use_semi_supervised: total_unsup += consistency_loss.item()
+            if use_semi:
+                total_unsup += consistency_loss.item()
             
             # 更新进度条右侧的显示
             pbar.set_postfix({
                 'loss': f"{loss.item():.4f}",
                 'sup': f"{supervised_loss.item():.4f}",
-                'unsup': f"{consistency_loss.item():.4f}"
+                'unsup': f"{consistency_loss.item():.4f}",
+                'cw': f"{consist_w:.2f}",
             })
         # 更新学习率
         scheduler.step()
         # 记录本 Epoch 平均 Loss
         avg_loss = total_loss / iterations_per_epoch
         avg_sup = total_sup / iterations_per_epoch
-        avg_unsup = (total_unsup / iterations_per_epoch) if use_semi_supervised else 0
+        avg_unsup = (total_unsup / iterations_per_epoch) if use_semi else 0.0
 
         # ------------验证集评估------------#
-        val_loss = validate(model, loader_val, DEVICE)
+        if epoch % args.val_every == 0:
+            val_loss = validate(model, loader_val, device, use_amp=args.amp)
+        else:
+            val_loss = logger.history['val_loss'][-1] if logger.history['val_loss'] \
+                else float('inf')
+ 
         logger.update(epoch, avg_loss, avg_sup, avg_unsup, val_loss)
+        print(f"[Epoch {epoch:3d}] train={avg_loss:.4f} (sup={avg_sup:.4f}, "
+              f"unsup={avg_unsup:.4f}) | val={val_loss:.4f} | "
+              f"lr={scheduler.get_last_lr()[0]:.2e} | cw={consist_w:.2f}")
         
-
-        if epoch % 10 == 0:
-            print(f"[*] Epoch {epoch:3d} | Train Loss: {avg_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.1e}")
-            save_snapshot(imgs_lab[0], t_line[0], p_line[0], epoch, RES_DIR, prefix="lab")
-            if use_semi_supervised:
-                save_snapshot(imgs_unlab[0], None, pseudo_labels[0], epoch, RES_DIR, prefix="unlab",aug_image=imgs_unlab_strong[0])
-                
-        if val_loss < best_val_loss:
+        # 可视化
+        if epoch % args.vis_every == 0:
+            save_snapshot(imgs_lab[0], t_line[0], p_line[0],
+                          epoch, exp_dir, prefix="lab")
+            if use_semi:
+                save_snapshot(imgs_unlab[0], None, pseudo[0],
+                              epoch, exp_dir, prefix="unlab",
+                              aug_image=imgs_unlab_strong[0])
+       
+        # 保存 best
+        improved = early_stopper.step(val_loss)
+        if improved:
             best_val_loss = val_loss
-            save_path = f"{RES_DIR}/best_model.pth"
-            if hasattr(model, 'module'):
-                torch.save(model.module.state_dict(), save_path)
-            else:
-                torch.save(model.state_dict(), save_path)
+            best_path = exp_dir / "best_model.pth"
+            state = model.module.state_dict() if hasattr(model, 'module') \
+                else model.state_dict()
+            torch.save(state, best_path)
+            print(f"   ↑ best updated: {best_val_loss:.4f}")
+            
+        # 保存 last(支持断点续训)
+        if epoch % args.ckpt_every == 0 or epoch == args.epochs:
+            save_checkpoint(exp_dir / "last_model.pth",
+                            model, ema_model, optimizer, scheduler, scaler,
+                            early_stopper, epoch, best_val_loss)
+        
+        # 早停
+        if early_stopper.should_stop:
+            print(f"[EarlyStop] val_loss 在 {args.patience} 个 epoch 内未改善,停止")
+            # 早停时也保存一份 last
+            save_checkpoint(exp_dir / "last_model.pth",
+                            model, ema_model, optimizer, scheduler, scaler,
+                            early_stopper, epoch, best_val_loss)
+            break
+
                 
     # 3. Finalize
     logger.plot_loss()
-    print(f"Experiment finished. Best Val Loss: {best_val_loss:.4f}. Reports generated in {RES_DIR}")
+    print(f"[Done] Best val_loss = {best_val_loss:.4f}, results in {exp_dir}")
     
     
-def validate(model, val_loader, device):
-    """在验证集上计算指标，关闭梯度更新"""
+# =====================================================
+# 验证 / 可视化
+# =====================================================
+@torch.no_grad()
+def validate(model, val_loader, device, use_amp=True):
     model.eval()
     total_loss = 0.0
-    
-    with torch.no_grad():
-        for imgs, targets in val_loader:
-            imgs, targets = imgs.to(device), targets.to(device)
+    n = 0
+    autocast_ctx = torch.cuda.amp.autocast if use_amp else nullcontext
+    for imgs, targets in val_loader:
+        imgs, targets = imgs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
+        with torch.amp.autocast("cuda",enabled=use_amp):
             preds = model(imgs)
-            
-            # 使用同样的拓扑损失函数评估
-            loss = harness_topology_loss(preds, targets)
-            total_loss += loss.item()
-            
-    return total_loss / len(val_loader)
+            loss = harness_topology_loss(preds.float(), targets)
+        total_loss += loss.item() * imgs.size(0)
+        n += imgs.size(0)
+    return total_loss / max(1, n)
     
 def save_snapshot(image, t_line, p_line, epoch, save_dir, prefix="lab", aug_image=None):
     img_np = image.permute(1, 2, 0).cpu().numpy()
@@ -341,7 +529,53 @@ def evaluate_only(model_path, val_dir, save_dir="./val_results"):
     print(f"[*] 验证结束！可视化结果已保存至 {save_dir}")
     
     
-if __name__ == "__main__":
-    train_experiment()
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument('--labeled_dir',   default='./data/train')
+    p.add_argument('--unlabeled_dir', default='./data/data_unlabeled')
+    p.add_argument('--val_dir',       default='./data/val')
+ 
+    # 关键:resume 控制断点续训
+    p.add_argument('--resume', default=None,
+                   help='路径:已有实验目录(包含 last_model.pth)或 .pth 文件;'
+                        '若指定,则在该目录续训')
+    p.add_argument('--exp_dir', default=None,
+                   help='可选:手动指定实验输出目录,不指定则用时间戳新建')
+ 
+    # 训练超参
+    p.add_argument('--bs_lab',   type=int,   default=8)    # ← 改小
+    p.add_argument('--bs_unlab', type=int,   default=4)    # ← 改小
+    p.add_argument('--bs_val',   type=int,   default=8)
+    p.add_argument('--epochs',   type=int,   default=150)  # ← 缩短
+    p.add_argument('--base_lr',  type=float, default=2e-4) # ← 调小
+    p.add_argument('--wd',       type=float, default=5e-4) # ← 调小
+    p.add_argument('--max_consist_w', type=float, default=0.5)
+    p.add_argument('--rampup',   type=float, default=0.4)
+    p.add_argument('--ema_alpha', type=float, default=0.995)
+ 
+    # 工程相关
+    p.add_argument('--workers',  type=int, default=2)      # ← 数据少不需要 4
+    p.add_argument('--amp',      action='store_true', default=True)
+    p.add_argument('--val_every', type=int, default=2,
+                   help='每 N 个 epoch 跑一次 validate')
+    p.add_argument('--vis_every', type=int, default=10)
+    p.add_argument('--ckpt_every', type=int, default=5,
+                   help='每 N 个 epoch 保存一次 last_model')
+ 
+    # 早停
+    p.add_argument('--patience', type=int, default=25)
+    p.add_argument('--min_delta', type=float, default=1e-4)
+ 
+    # DDP / DP
+    p.add_argument('--no_dataparallel', action='store_true',
+                   help='禁用 DataParallel,单卡训练')
+ 
+    return p.parse_args()
+
+
+
     
+if __name__ == "__main__":
+    from contextlib import nullcontext
+    train_experiment()
     # evaluate_only(model_path="./Mean-Teacher/best_model.pth", val_dir="./data/val", save_dir="./val_results")
