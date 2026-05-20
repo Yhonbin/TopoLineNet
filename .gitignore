@@ -13,7 +13,6 @@ Mean-Teacher/
 others_output/
 answer_output/
 pretrained_model/
-eval_results/
 exp_*/
 
 # Data directories
