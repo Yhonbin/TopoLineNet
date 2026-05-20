@@ -554,7 +554,7 @@ def parse_args():
     p.add_argument('--ema_alpha', type=float, default=0.995)
  
     # 工程相关
-    p.add_argument('--workers',  type=int, default=2)      # ← 数据少不需要 4
+    p.add_argument('--workers',  type=int, default=2)  
     p.add_argument('--amp',      action='store_true', default=True)
     p.add_argument('--val_every', type=int, default=2,
                    help='每 N 个 epoch 跑一次 validate')
