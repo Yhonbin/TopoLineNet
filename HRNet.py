@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
-import cv2
 import numpy as np
+import math
 # ==========================================
 # Module 1: Models (HRNet + CBAM + Strip Pooling)
 # ==========================================
@@ -79,41 +79,39 @@ class StripPooling(nn.Module):
         return x * self.conv2(pool_h + pool_w)
     
 class ASPP(nn.Module):
-    """
-    新增 Neck 模块：空洞空间金字塔池化
-    利用多尺度感受野，大幅增强网络对连续长线束的“大局观”，跨越遮挡。
-    """
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, num_groups=32):
         super().__init__()
-        # 1x1 Conv
+        # 辅助函数:统一构建 Conv + GN + ReLU
+        def _gn(c):
+            # 保证 num_groups 能整除 channels
+            g = num_groups if c % num_groups == 0 else math.gcd(num_groups, c)
+            return nn.GroupNorm(g, c)
+
         self.aspp1 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
+            _gn(out_channels),
             nn.ReLU(inplace=True)
         )
-        # 膨胀率为 6 的 3x3 Conv
         self.aspp2 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 3, padding=6, dilation=6, bias=False),
-            nn.BatchNorm2d(out_channels),
+            _gn(out_channels),
             nn.ReLU(inplace=True)
         )
-        # 膨胀率为 12 的 3x3 Conv
         self.aspp3 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 3, padding=12, dilation=12, bias=False),
-            nn.BatchNorm2d(out_channels),
+            _gn(out_channels),
             nn.ReLU(inplace=True)
         )
-        # 全局平均池化分支
+        # global_pool 分支:这里是问题点,必须用 GN
         self.global_pool = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Conv2d(in_channels, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
+            _gn(out_channels),
             nn.ReLU(inplace=True)
         )
-        
         self.project = nn.Sequential(
             nn.Conv2d(out_channels * 4, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
+            _gn(out_channels),
             nn.ReLU(inplace=True),
             nn.Dropout(0.1)
         )
@@ -122,9 +120,9 @@ class ASPP(nn.Module):
         x1 = self.aspp1(x)
         x2 = self.aspp2(x)
         x3 = self.aspp3(x)
-        x4 = F.interpolate(self.global_pool(x), size=x.size()[2:], mode='bilinear', align_corners=True)
-        x_concat = torch.cat((x1, x2, x3, x4), dim=1)
-        return self.project(x_concat)
+        x4 = F.interpolate(self.global_pool(x), size=x.size()[2:],
+                           mode='bilinear', align_corners=True)
+        return self.project(torch.cat((x1, x2, x3, x4), dim=1))
 
 class HarnessHRNetV2(nn.Module):
     def __init__(self, model_name='hrnet_w18', pretrained=False):
