@@ -37,3 +37,9 @@ __pycache__/
 
 # Claude
 .claude/
+
+# SSH
+.ssh/
+
+# Other Projects
+DSCNet/
