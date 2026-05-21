@@ -244,6 +244,21 @@ class _VanillaHRNetSeg(nn.Module):
         return out   # logits; wrapper applies sigmoid
 
 
+def build_dscnet(pretrained: bool = False, base: int = 32,
+                 kernel_size: int = 9) -> nn.Module:
+    """
+    DSCNet (Dynamic Snake Convolution, Qi et al. ICCV 2023) — tubular/curvilinear
+    SOTA. Built from the official DSConv operator via dscnet_adapter (isolated
+    so DSCNet's dependency does not affect any other model).
+ 
+    pretrained is ignored: DSConv is trained from scratch (no ImageNet weights
+    exist for the snake operator). We keep the arg for a uniform factory API.
+    """
+    from dscnet_adapter import build_dscnet_core
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    core = build_dscnet_core(device=device, base=base, kernel_size=kernel_size)
+    return CenterlineHeatmapWrapper(core, apply_sigmoid=True)
+
 def build_ours(pretrained: bool = True) -> nn.Module:
     """
     Our full model.  Imported from your existing HRNet.py untouched.
@@ -272,6 +287,8 @@ MODEL_REGISTRY = {
                       "LinkNet (ResNet34), road-extraction style baseline"),
     "hrnet_vanilla": (build_hrnet_vanilla, {},
                       "Plain HRNet-W18, no CBAM/StripPool/ASPP (backbone ablation)"),
+    "dscnet":        (build_dscnet,        {"base": 32, "kernel_size": 9},
+                      "DSCNet (Dynamic Snake Conv, ICCV2023), tubular SOTA"),
     "ours":          (build_ours,          {},
                       "TopoLineNet (Ours-Full): HRNet+CBAM+StripPool+ASPP"),
 }
