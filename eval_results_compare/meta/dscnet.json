@@ -4,8 +4,8 @@
   "device": "cuda",
   "threshold": 0.5,
   "n_images": 11,
-  "elapsed_sec": 3.165663480758667,
-  "ms_per_image": 287.78758915987885,
+  "elapsed_sec": 1.3029041290283203,
+  "ms_per_image": 118.44582991166548,
   "params_M": 4.572873,
   "checkpoint": "exp_compare/dscnet/best_model.pth"
 }

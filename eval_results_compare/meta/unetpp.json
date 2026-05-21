@@ -4,8 +4,8 @@
   "device": "cuda",
   "threshold": 0.5,
   "n_images": 11,
-  "elapsed_sec": 1.434906244277954,
-  "ms_per_image": 130.44602220708674,
+  "elapsed_sec": 1.9011566638946533,
+  "ms_per_image": 172.83242399042302,
   "params_M": 26.078609,
   "checkpoint": "exp_compare/unetpp/best_model.pth"
 }

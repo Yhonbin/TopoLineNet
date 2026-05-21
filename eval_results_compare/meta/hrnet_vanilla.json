@@ -4,8 +4,8 @@
   "device": "cuda",
   "threshold": 0.5,
   "n_images": 11,
-  "elapsed_sec": 1.9108271598815918,
-  "ms_per_image": 173.71155998923564,
+  "elapsed_sec": 1.6496310234069824,
+  "ms_per_image": 149.96645667336202,
   "params_M": 15.520085,
   "checkpoint": "exp_compare/hrnet_vanilla/best_model.pth"
 }

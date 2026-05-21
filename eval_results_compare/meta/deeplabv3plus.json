@@ -4,8 +4,8 @@
   "device": "cuda",
   "threshold": 0.5,
   "n_images": 11,
-  "elapsed_sec": 1.4658172130584717,
-  "ms_per_image": 133.25611027804288,
+  "elapsed_sec": 1.2426514625549316,
+  "ms_per_image": 112.96831477772105,
   "params_M": 26.677585,
   "checkpoint": "exp_compare/deeplabv3plus/best_model.pth"
 }

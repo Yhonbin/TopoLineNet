@@ -178,42 +178,68 @@ class Evaluator:
 
     # -----------------------------------------------------------------------
     def export_summary(self,
-                       csv_name: str = "summary.csv",
-                       tex_name: str = "summary.tex",
-                       headline_only: bool = True):
+                   csv_name: str = "summary.csv",
+                   tex_name: str = "summary.tex",
+                   headline_only: bool = True):
         """
         Write a cross-method summary table.
-        - csv  : machine-readable, every (mean, std) column.
-        - tex  : LaTeX fragment with headline metrics only, formatted "mean±std".
+        - csv : machine-readable, every (mean, std) column.
+        - tex : LaTeX fragment with headline metrics only, formatted "mean±std".
         """
-        if not self.summary_rows:
+        csv_path = self.out_dir / csv_name
+        tex_path = self.out_dir / tex_name
+    
+        # ---------- 1. 读取磁盘历史数据 ----------
+        if csv_path.exists():
+            try:
+                existing_df = pd.read_csv(csv_path)
+                existing_rows = existing_df.to_dict(orient="records")
+                print(f"[Evaluator] loaded {len(existing_rows)} existing rows from {csv_path}")
+            except Exception as e:
+                print(f"[Evaluator] warning: failed to read existing summary ({e}), starting fresh.")
+                existing_rows = []
+        else:
+            existing_rows = []
+    
+        # ---------- 2. 合并：本次评估数据优先（按 method 去重） ----------
+        # 先把历史数据按 method 建索引
+        merged: dict[str, dict] = {r["method"]: r for r in existing_rows}
+        # 用本次内存中的新数据覆盖（若 method 相同则更新，若新 method 则添加）
+        for row in self.summary_rows:
+            merged[row["method"]] = row
+    
+        if not merged:
             print("[Evaluator] nothing to export.")
             return None
-
-        df = pd.DataFrame(self.summary_rows)
-        df.to_csv(self.out_dir / csv_name, index=False)
-        print(f"[Evaluator] summary -> {self.out_dir / csv_name}")
-
-        # LaTeX fragment with the headline metrics
-        cols = HEADLINE_METRICS if headline_only else \
+    
+        # ---------- 3. 写 CSV ----------
+        df = pd.DataFrame(list(merged.values()))
+        # 保证 method 列在最前
+        cols = ["method"] + [c for c in df.columns if c != "method"]
+        df = df[cols]
+        df.to_csv(csv_path, index=False)
+        print(f"[Evaluator] summary ({len(df)} methods) -> {csv_path}")
+    
+        # ---------- 4. 写 LaTeX ----------
+        cols_tex = HEADLINE_METRICS if headline_only else \
             [c[:-5] for c in df.columns if c.endswith("_mean")]
         lines = []
-        lines.append(r"\begin{tabular}{l" + "c" * len(cols) + "}")
+        lines.append(r"\begin{tabular}{l" + "c" * len(cols_tex) + "}")
         lines.append(r"\toprule")
-        lines.append("Method & " + " & ".join(cols) + r" \\")
+        lines.append("Method & " + " & ".join(cols_tex) + r" \\")
         lines.append(r"\midrule")
         for _, row in df.iterrows():
-            cells = [row["method"]]
-            for c in cols:
+            cells = [str(row["method"])]
+            for c in cols_tex:
                 m = row.get(f"{c}_mean", float("nan"))
-                s = row.get(f"{c}_std", float("nan"))
+                s = row.get(f"{c}_std",  float("nan"))
                 cells.append(f"{m:.3f}$\\pm${s:.3f}")
             lines.append(" & ".join(cells) + r" \\")
         lines.append(r"\bottomrule")
         lines.append(r"\end{tabular}")
-        with open(self.out_dir / tex_name, "w") as f:
+        with open(tex_path, "w") as f:
             f.write("\n".join(lines))
-        print(f"[Evaluator] LaTeX  -> {self.out_dir / tex_name}")
+        print(f"[Evaluator] LaTeX  -> {tex_path}")
         return df
 
     # -----------------------------------------------------------------------
@@ -225,7 +251,86 @@ class Evaluator:
                 print(f"  {k:14s} : {agg[mk]:.4f} ± {agg[sk]:.4f}")
         print(f"  inference     : {agg['ms_per_image']:.1f} ms/img")
         print("")
-
+        
+        
+    def rebuild_summary_from_per_image(self):
+        """
+        从 per_image/<method>.csv 重新计算每个方法的 mean/std 汇总行，
+        并追加到 self.summary_rows（不会重复已有方法）。
+    
+        适用场景：
+        - summary.csv 被意外覆盖，但 per_image/ 目录完整保留
+        - 希望把所有历史方法一次性重建到 summary.csv
+    
+        用法：
+            ev = Evaluator(test_dir=..., out_dir="./eval_results")
+            ev.rebuild_summary_from_per_image()
+            ev.export_summary()
+        """
+        per_image_dir = self.out_dir / "per_image"
+        if not per_image_dir.exists():
+            print("[Evaluator] per_image/ directory not found, nothing to rebuild.")
+            return
+    
+        # 已在内存中的 method 名（不重复添加）
+        existing_methods = {r["method"] for r in self.summary_rows}
+    
+        csv_files = sorted(per_image_dir.glob("*.csv"))
+        if not csv_files:
+            print("[Evaluator] no per-image CSV files found.")
+            return
+    
+        rebuilt = 0
+        for csv_file in csv_files:
+            method_name = csv_file.stem          # 文件名去掉 .csv 即 method 名
+            if method_name in existing_methods:
+                print(f"[Evaluator] skip (already in memory): {method_name}")
+                continue
+    
+            try:
+                per_image_df = pd.read_csv(csv_file)
+            except Exception as e:
+                print(f"[Evaluator] warning: cannot read {csv_file} ({e}), skipping.")
+                continue
+    
+            if per_image_df.empty:
+                print(f"[Evaluator] warning: {csv_file} is empty, skipping.")
+                continue
+    
+            # 重新聚合 mean / std（与 run() 里的逻辑完全一致）
+            agg = {"method": method_name}
+            for col in per_image_df.columns:
+                if col in ("image_idx",):
+                    continue
+                try:
+                    vals = per_image_df[col].values.astype(float)
+                    agg[f"{col}_mean"] = float(np.mean(vals))
+                    agg[f"{col}_std"]  = float(np.std(vals))
+                except (ValueError, TypeError):
+                    pass   # 非数值列跳过
+            agg["n_images"] = int(len(per_image_df))
+    
+            # 尝试从 meta/<method>.json 补充 elapsed_sec / ms_per_image
+            meta_path = self.out_dir / "meta" / f"{method_name}.json"
+            if meta_path.exists():
+                try:
+                    import json
+                    with open(meta_path) as f:
+                        meta = json.load(f)
+                    agg["elapsed_sec"]  = meta.get("elapsed_sec",  float("nan"))
+                    agg["ms_per_image"] = meta.get("ms_per_image", float("nan"))
+                except Exception:
+                    pass
+            else:
+                agg["elapsed_sec"]  = float("nan")
+                agg["ms_per_image"] = float("nan")
+    
+            self.summary_rows.append(agg)
+            existing_methods.add(method_name)
+            rebuilt += 1
+            print(f"[Evaluator] rebuilt from per-image: {method_name}  ({agg['n_images']} images)")
+    
+        print(f"[Evaluator] rebuild complete: {rebuilt} method(s) added to memory.")
 
 # ---------------------------------------------------------------------------
 def _count_params(model) -> float:

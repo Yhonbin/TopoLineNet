@@ -1,0 +1,11 @@
+{
+  "method": "linknet",
+  "test_dir": "./data/val",
+  "device": "cuda",
+  "threshold": 0.5,
+  "n_images": 11,
+  "elapsed_sec": 1.2112526893615723,
+  "ms_per_image": 110.11388085105202,
+  "params_M": 21.771937,
+  "checkpoint": "exp_compare/linknet/best_model.pth"
+}
