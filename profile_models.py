@@ -18,7 +18,7 @@ import torch.nn as nn
 import os
 from compare_models import build_model, MODEL_REGISTRY
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3" 
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,3" 
 
 # ---------------------------------------------------------------------------
 # 1. Parameter count
@@ -169,7 +169,7 @@ def profile_ours_breakdown(device, input_size=(1, 3, 512, 512)):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", default="all")
-    ap.add_argument("--bs", type=int, default=8, help="batch size for timing")
+    ap.add_argument("--bs", type=int, default=4, help="batch size for timing")
     ap.add_argument("--size", type=int, default=512, help="input H=W")
     args = ap.parse_args()
 

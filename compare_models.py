@@ -244,19 +244,33 @@ class _VanillaHRNetSeg(nn.Module):
         return out   # logits; wrapper applies sigmoid
 
 
-def build_dscnet(pretrained: bool = False, base: int = 32,
+def build_dscnet(pretrained: bool = False, number: int = 32,
                  kernel_size: int = 9) -> nn.Module:
     """
-    DSCNet (Dynamic Snake Convolution, Qi et al. ICCV 2023) — tubular/curvilinear
-    SOTA. Built from the official DSConv operator via dscnet_adapter (isolated
-    so DSCNet's dependency does not affect any other model).
+    DSCNet — ORIGINAL architecture from the authors' S3_DSCNet_pro.py
+    (Qi et al. ICCV 2023). This is the published network, not a reconstruction.
+    Recommended for the main comparison table.
  
-    pretrained is ignored: DSConv is trained from scratch (no ImageNet weights
-    exist for the snake operator). We keep the arg for a uniform factory API.
+    pretrained is ignored: DSConv has no ImageNet weights.
+    `number` controls the base channel width (authors' default = 32).
     """
-    from dscnet_adapter import build_dscnet_core
+    from dscnet_adapter import build_dscnet_original
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    core = build_dscnet_core(device=device, base=base, kernel_size=kernel_size)
+    core = build_dscnet_original(device=device, number=number,
+                                 kernel_size=kernel_size)
+    # DSCNetProWrapper returns logits (sigmoid stripped) -> wrapper adds sigmoid.
+    return CenterlineHeatmapWrapper(core, apply_sigmoid=True)
+
+def build_dscnet_lite(pretrained: bool = False, base: int = 32,
+                      kernel_size: int = 9) -> nn.Module:
+    """
+    Lightweight DSConv-based U-Net (our construction, NOT the original paper).
+    Only uses the DSConv_pro operator; architecture is ours. Smaller, faster,
+    useful for ablation on the operator itself vs full DSCNet architecture.
+    """
+    from dscnet_adapter import build_dscnet_lite as _build_lite
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    core = _build_lite(device=device, base=base, kernel_size=kernel_size)
     return CenterlineHeatmapWrapper(core, apply_sigmoid=True)
 
 def build_ours(pretrained: bool = True) -> nn.Module:
@@ -287,8 +301,10 @@ MODEL_REGISTRY = {
                       "LinkNet (ResNet34), road-extraction style baseline"),
     "hrnet_vanilla": (build_hrnet_vanilla, {},
                       "Plain HRNet-W18, no CBAM/StripPool/ASPP (backbone ablation)"),
-    "dscnet":        (build_dscnet,        {"base": 32, "kernel_size": 9},
-                      "DSCNet (Dynamic Snake Conv, ICCV2023), tubular SOTA"),
+    "dscnet":        (build_dscnet,        {"number": 32, "kernel_size": 9},
+                      "DSCNet (Original, Qi et al. ICCV2023), tubular SOTA"),
+    "dscnet_lite":   (build_dscnet_lite,   {"base": 32, "kernel_size": 9},
+                      "DSConv U-Net (lite, our construction), operator ablation"),
     "ours":          (build_ours,          {},
                       "TopoLineNet (Ours-Full): HRNet+CBAM+StripPool+ASPP"),
 }
