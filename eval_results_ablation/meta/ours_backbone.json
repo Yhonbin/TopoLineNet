@@ -1,0 +1,11 @@
+{
+  "method": "ours_backbone",
+  "test_dir": "./data/val",
+  "device": "cuda",
+  "threshold": 0.5,
+  "n_images": 11,
+  "elapsed_sec": 1.5425431728363037,
+  "ms_per_image": 140.23119753057307,
+  "params_M": 12.691285,
+  "checkpoint": "exp_ablation/ours_backbone/best_model.pth"
+}

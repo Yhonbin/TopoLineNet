@@ -7,26 +7,7 @@ import math
 # ==========================================
 # Module 1: Models (HRNet + CBAM + Strip Pooling)
 # ==========================================
-# class CBAMLayer(nn.Module):
-#     """CBAM 注意力机制：提升模型在复杂背景（如白色标签）下的辨别力"""
-#     def __init__(self, channels, reduction=16):
-#         super(CBAMLayer, self).__init__()
-#         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-#         self.max_pool = nn.AdaptiveMaxPool2d(1)
-#         self.fc = nn.Sequential(
-#             nn.Conv2d(channels, channels // reduction, 1, bias=False),
-#             nn.ReLU(inplace=True),
-#             nn.Conv2d(channels // reduction, channels, 1, bias=False)
-#         )
-#         self.sigmoid = nn.Sigmoid()
 
-#     def forward(self, x):
-#         avg_out = self.fc(self.avg_pool(x))
-#         max_out = self.fc(self.max_pool(x))
-#         out = self.sigmoid(avg_out + max_out)
-#         return x * out
-    
-    
 class CBAMLayer(nn.Module):
     def __init__(self, channels, reduction=16):
         super().__init__()
@@ -79,13 +60,15 @@ class StripPooling(nn.Module):
         return x * self.conv2(pool_h + pool_w)
     
 class ASPP(nn.Module):
-    def __init__(self, in_channels, out_channels, num_groups=32):
+    def __init__(self, in_channels, out_channels, num_groups=32, dilations=(6,12)):
         super().__init__()
         # 辅助函数:统一构建 Conv + GN + ReLU
         def _gn(c):
             # 保证 num_groups 能整除 channels
             g = num_groups if c % num_groups == 0 else math.gcd(num_groups, c)
             return nn.GroupNorm(g, c)
+        
+        d1, d2 = dilations  # 暴露空洞率，方便消融时改小（如 (2,4)）验证细结构友好性
 
         self.aspp1 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 1, bias=False),
@@ -93,12 +76,12 @@ class ASPP(nn.Module):
             nn.ReLU(inplace=True)
         )
         self.aspp2 = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, padding=6, dilation=6, bias=False),
+            nn.Conv2d(in_channels, out_channels, 3, padding=d1, dilation=d1, bias=False),
             _gn(out_channels),
             nn.ReLU(inplace=True)
         )
         self.aspp3 = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, padding=12, dilation=12, bias=False),
+            nn.Conv2d(in_channels, out_channels, 3, padding=d2, dilation=d2, bias=False),
             _gn(out_channels),
             nn.ReLU(inplace=True)
         )
@@ -123,22 +106,92 @@ class ASPP(nn.Module):
         x4 = F.interpolate(self.global_pool(x), size=x.size()[2:],
                            mode='bilinear', align_corners=True)
         return self.project(torch.cat((x1, x2, x3, x4), dim=1))
+    
+
+class SimpleNeck(nn.Module):
+    """关闭 ASPP 时的替代 neck：仅做通道融合/压缩，不引入多空洞分支。"""
+    def __init__(self, in_channels, out_channels, num_groups=32):
+        super().__init__()
+ 
+        def _gn(c):
+            g = num_groups if c % num_groups == 0 else math.gcd(num_groups, c)
+            return nn.GroupNorm(g, c)
+ 
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            _gn(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            _gn(out_channels),
+            nn.ReLU(inplace=True),
+        )
+ 
+    def forward(self, x):
+        return self.block(x)    
+
 
 class HarnessHRNetV2(nn.Module):
-    def __init__(self, model_name='hrnet_w18', pretrained=False):
+    """
+    带消融开关的主干模型。
+ 
+    消融开关 (默认全开 -> 行为与原始模型完全一致):
+        use_cbam        : 是否启用 CBAM 通道+空间注意力
+        use_strip_pool  : 是否启用 StripPooling 条形池化
+        use_aspp        : 是否启用 ASPP neck (关闭时用 SimpleNeck 替代)
+ 
+    设计要点
+    --------
+    1. 关闭某模块时是「真正跳过该模块的前向计算」(用 nn.Identity 或
+       完全不构建)，而不是乘以 0，因此 profile_models.py 测到的耗时变化
+       是真实的，可直接作为消融实验的速度数据。
+    2. head 的输入通道恒为 aspp_out_channels，无论 ASPP 开关如何，下游
+       (train_net.py / compare_models.py / evaluate_metric.py) 全部无需改动。
+    3. 关闭模块时其参数不会被构建，故消融配置下的参数量统计也是真实的。
+ 
+    用法
+    ----
+        # 完整模型 (= 原始行为)
+        model = HarnessHRNetV2(pretrained=True)
+ 
+        # 只去掉 ASPP
+        model = HarnessHRNetV2(pretrained=True, use_aspp=False)
+ 
+        # 只保留 backbone (= vanilla 风格, 三个模块全关)
+        model = HarnessHRNetV2(pretrained=True,
+                               use_cbam=False, use_strip_pool=False, use_aspp=False)
+    """
+    def __init__(self, model_name='hrnet_w18', pretrained=False,
+                 use_cbam=True, use_strip_pool=True, use_aspp=True, aspp_dilations=(6,12)):
         super(HarnessHRNetV2, self).__init__()
+        # ---- 记录消融配置 ----
+        self.use_cbam = use_cbam
+        self.use_strip_pool = use_strip_pool
+        self.use_aspp = use_aspp
+
         self.backbone = timm.create_model(model_name,features_only=True)
         if (pretrained):
             self.backbone.load_state_dict(torch.load('./pretrained_model/hrnetv2_w18_imagenet_pretrained.pth'), strict=False)
         feature_info = self.backbone.feature_info.channels()
         
-        # 增加注意力模块
-        self.attentions = nn.ModuleList([CBAMLayer(c) for c in feature_info])
-        self.strip_pools = nn.ModuleList([StripPooling(c) for c in feature_info])
+        # ---- 注意力模块 (按开关构建; 关闭则用 Identity 占位以保持索引一致) ----
+        if self.use_cbam:
+            self.attentions = nn.ModuleList([CBAMLayer(c) for c in feature_info])
+        else:
+            self.attentions = nn.ModuleList([nn.Identity() for _ in feature_info])
+ 
+        if self.use_strip_pool:
+            self.strip_pools = nn.ModuleList([StripPooling(c) for c in feature_info])
+        else:
+            self.strip_pools = nn.ModuleList([nn.Identity() for _ in feature_info])
+            
         total_channels = sum(feature_info)
         aspp_out_channels = 256
         
-        self.neck = ASPP(total_channels, aspp_out_channels)  # 新增 Neck 模块，输出固定通道数
+        # ---- Neck: ASPP 或 轻量替代 ----
+        if self.use_aspp:
+            self.neck = ASPP(total_channels, aspp_out_channels, dilations=aspp_dilations)
+        else:
+            self.neck = SimpleNeck(total_channels, aspp_out_channels)
         # Head A: 预测线束中心线
         self.head_line = nn.Sequential(
             nn.Conv2d(aspp_out_channels, 128, kernel_size=3, padding=1),
@@ -153,25 +206,38 @@ class HarnessHRNetV2(nn.Module):
             nn.BatchNorm2d(32), nn.ReLU(inplace=True),
             nn.Conv2d(32, 1, kernel_size=1) # 输出单通道热力图
         )
+    
+    def ablation_tag(self):
+        """返回当前消融配置的可读标签，便于日志/权重命名。"""
+        parts = []
+        parts.append("cbam" if self.use_cbam else "noCbam")
+        parts.append("strip" if self.use_strip_pool else "noStrip")
+        parts.append("aspp" if self.use_aspp else "noAspp")
+        return "_".join(parts)
 
     def forward(self, x):
         features = self.backbone(x)
-        # 应用注意力
-        # features = [self.attentions[i](f) for i, f in enumerate(features)]
-        # target_size = features[0].shape[-2:]
-        # resized_features = [F.interpolate(f, size=target_size, mode='bilinear', align_corners=True) for f in features]
+ 
         enhanced_features = []
         for i, f in enumerate(features):
+            # CBAM: 开关关闭时 self.attentions[i] 是 Identity, 零开销跳过
             f_att = self.attentions[i](f)
-            f_strip = self.strip_pools[i](f_att) # 捕获被标签遮挡的上下文
+            # StripPooling: 同上
+            f_strip = self.strip_pools[i](f_att)
             enhanced_features.append(f_strip)
+ 
         target_size = enhanced_features[0].shape[-2:]
-        resized_features = [F.interpolate(f, size=target_size, mode='bilinear', align_corners=True) for f in enhanced_features]
+        resized_features = [
+            F.interpolate(f, size=target_size, mode='bilinear', align_corners=True)
+            for f in enhanced_features
+        ]
         combined = torch.cat(resized_features, dim=1)
-        
-        neck_out = self.neck(combined)  # 通过 Neck 模块融合多尺度特征
-        # 输出
-        out_line = torch.sigmoid(F.interpolate(self.head_line(neck_out), size=x.shape[-2:], mode='bilinear', align_corners=True))
-    
+ 
+        neck_out = self.neck(combined)  # ASPP 或 SimpleNeck
+ 
+        out_line = torch.sigmoid(
+            F.interpolate(self.head_line(neck_out), size=x.shape[-2:],
+                          mode='bilinear', align_corners=True))
+ 
         return out_line
 

@@ -1,0 +1,11 @@
+{
+  "method": "ours_no_aspp",
+  "test_dir": "./data/val",
+  "device": "cuda",
+  "threshold": 0.5,
+  "n_images": 11,
+  "elapsed_sec": 1.6912767887115479,
+  "ms_per_image": 153.75243533741346,
+  "params_M": 17.060543,
+  "checkpoint": "exp_ablation/ours_no_aspp/best_model.pth"
+}

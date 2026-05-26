@@ -1,0 +1,11 @@
+{
+  "method": "ours_no_cbam",
+  "test_dir": "./data/val",
+  "device": "cuda",
+  "threshold": 0.5,
+  "n_images": 11,
+  "elapsed_sec": 2.577904224395752,
+  "ms_per_image": 234.35492949052292,
+  "params_M": 26.209493,
+  "checkpoint": "exp_ablation/ours_no_cbam/best_model.pth"
+}

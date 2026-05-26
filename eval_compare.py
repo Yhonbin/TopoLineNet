@@ -32,7 +32,7 @@ import torch
 
 from evaluate_metric import Evaluator
 from compare_models import build_model, MODEL_REGISTRY
-
+import ablation_models
 
 def _load_into(model, ckpt_path, device):
     """Load a state_dict saved by train_compare.py, tolerant to DP prefixes."""

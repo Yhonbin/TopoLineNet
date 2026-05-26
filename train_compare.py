@@ -45,7 +45,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-
 # --- reuse your existing building blocks verbatim ---------------------------
 from Datasets import HarnessDataset, UnlabeledHarnessDataset
 from loss import harness_topology_loss
@@ -62,6 +61,7 @@ from train_net import (
     save_snapshot,
 )
 from compare_models import build_model, MODEL_REGISTRY, list_models
+import ablation_models
 
 
 # ---------------------------------------------------------------------------

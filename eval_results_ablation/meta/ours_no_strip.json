@@ -1,0 +1,11 @@
+{
+  "method": "ours_no_strip",
+  "test_dir": "./data/val",
+  "device": "cuda",
+  "threshold": 0.5,
+  "n_images": 11,
+  "elapsed_sec": 1.9471004009246826,
+  "ms_per_image": 177.00912735678935,
+  "params_M": 22.190399,
+  "checkpoint": "exp_ablation/ours_no_strip/best_model.pth"
+}
